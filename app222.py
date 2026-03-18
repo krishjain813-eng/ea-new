@@ -6,10 +6,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy import stats
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import cross_val_score
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
+from sklearn.model_selection import cross_val_score, cross_val_predict, StratifiedKFold
+from sklearn.metrics import (classification_report, confusion_matrix, roc_curve, auc,
+                              accuracy_score, precision_score, recall_score, f1_score, roc_auc_score)
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -656,16 +658,18 @@ with tab3:
     st.markdown("""
     <div class='section-header'>
         <h3>🤖 Predictive Analysis — What will happen?</h3>
-        <p>Machine learning models to predict attrition and identify key predictive features</p>
+        <p>Decision Tree, Random Forest & Gradient Boosting with 5-Fold CV — Confusion Matrices, Performance Comparison & ROC Curves</p>
     </div>""", unsafe_allow_html=True)
 
     @st.cache_data
     def run_predictive_models(data):
         df_ml = data.copy()
         cat_features = ['BusinessTravel','Department','EducationField','Gender','JobRole','MaritalStatus','OverTime']
+        label_encoders = {}
         for c in cat_features:
             le = LabelEncoder()
             df_ml[c+'_enc'] = le.fit_transform(df_ml[c])
+            label_encoders[c] = le
         
         feature_cols = ['Age','DailyRate','DistanceFromHome','Education','EnvironmentSatisfaction',
                         'HourlyRate','JobInvolvement','JobLevel','JobSatisfaction','MonthlyIncome',
@@ -679,71 +683,180 @@ with tab3:
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
-        # Models
+        # Models — Decision Tree, Random Forest, Gradient Boosting
         models = {
-            'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
+            'Decision Tree': DecisionTreeClassifier(random_state=42, class_weight='balanced', max_depth=8),
             'Random Forest': RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced'),
             'Gradient Boosting': GradientBoostingClassifier(n_estimators=200, random_state=42)
         }
 
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         results = {}
+
         for name, model in models.items():
-            scores = cross_val_score(model, X_scaled, y, cv=5, scoring='roc_auc')
+            # Collect fold-level metrics
+            train_accs, test_accs = [], []
+            test_preds_all, test_true_all, test_proba_all = [], [], []
+            train_preds_all, train_true_all = [], []
+
+            for train_idx, test_idx in cv.split(X_scaled, y):
+                X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+                y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+                model_clone = type(model)(**model.get_params())
+                model_clone.fit(X_train, y_train)
+
+                # Training predictions
+                y_train_pred = model_clone.predict(X_train)
+                train_accs.append(accuracy_score(y_train, y_train_pred))
+                train_preds_all.extend(y_train_pred)
+                train_true_all.extend(y_train)
+
+                # Testing predictions
+                y_test_pred = model_clone.predict(X_test)
+                y_test_proba = model_clone.predict_proba(X_test)[:, 1]
+                test_accs.append(accuracy_score(y_test, y_test_pred))
+                test_preds_all.extend(y_test_pred)
+                test_true_all.extend(y_test)
+                test_proba_all.extend(y_test_proba)
+
+            test_true_all = np.array(test_true_all)
+            test_preds_all = np.array(test_preds_all)
+            test_proba_all = np.array(test_proba_all)
+            train_true_all = np.array(train_true_all)
+            train_preds_all = np.array(train_preds_all)
+
+            # Train final model on full data for feature importance
             model.fit(X_scaled, y)
             if hasattr(model, 'feature_importances_'):
                 importance = model.feature_importances_
             else:
                 importance = np.abs(model.coef_[0])
+
+            # ROC data
+            fpr, tpr, _ = roc_curve(test_true_all, test_proba_all)
+            roc_auc_val = auc(fpr, tpr)
+
+            # Confusion matrix on aggregated CV test predictions
+            cm = confusion_matrix(test_true_all, test_preds_all)
+
             results[name] = {
-                'auc_mean': scores.mean(), 'auc_std': scores.std(),
+                'train_acc': np.mean(train_accs),
+                'test_acc': np.mean(test_accs),
+                'test_precision': precision_score(test_true_all, test_preds_all, zero_division=0),
+                'test_recall': recall_score(test_true_all, test_preds_all, zero_division=0),
+                'test_f1': f1_score(test_true_all, test_preds_all, zero_division=0),
+                'auc': roc_auc_val,
+                'train_precision': precision_score(train_true_all, train_preds_all, zero_division=0),
+                'train_recall': recall_score(train_true_all, train_preds_all, zero_division=0),
+                'train_f1': f1_score(train_true_all, train_preds_all, zero_division=0),
+                'confusion_matrix': cm,
+                'fpr': fpr, 'tpr': tpr,
                 'importance': pd.Series(importance, index=feature_cols).sort_values(ascending=False),
-                'model': model
+                'model': model,
             }
 
-        # ROC Curves
-        from sklearn.model_selection import cross_val_predict
-        roc_data = {}
-        for name, model in models.items():
-            y_prob = cross_val_predict(model, X_scaled, y, cv=5, method='predict_proba')[:,1]
-            fpr, tpr, _ = roc_curve(y, y_prob)
-            roc_auc = auc(fpr, tpr)
-            roc_data[name] = {'fpr': fpr, 'tpr': tpr, 'auc': roc_auc}
+        return results, feature_cols, scaler, label_encoders, cat_features
 
-        return results, roc_data, feature_cols
+    results, feature_cols, fitted_scaler, label_encoders, cat_features = run_predictive_models(df)
+    model_colors = {'Decision Tree': '#818cf8', 'Random Forest': '#c084fc', 'Gradient Boosting': '#f472b6'}
 
-    results, roc_data, feature_cols = run_predictive_models(df)
+    # ───────────────────────────────────────────────────────────
+    # 1. CONFUSION MATRICES — one per model
+    # ───────────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'><h3>📊 Confusion Matrices (5-Fold CV — Aggregated Test Predictions)</h3><p>Rows = Actual, Columns = Predicted · Labelled as No (Stayed) and Yes (Left)</p></div>", unsafe_allow_html=True)
 
-    # Model comparison
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        model_comp = pd.DataFrame({
-            'Model': list(results.keys()),
-            'AUC (mean)': [results[m]['auc_mean'] for m in results],
-            'AUC (std)': [results[m]['auc_std'] for m in results],
+    cm_cols = st.columns(3)
+    for idx, (name, res) in enumerate(results.items()):
+        with cm_cols[idx]:
+            cm = res['confusion_matrix']
+            cm_pct = (cm / cm.sum() * 100).round(1)
+            # Build annotation text: count + percentage
+            text_annot = [[f"<b>{cm[i][j]}</b><br>({cm_pct[i][j]}%)" for j in range(2)] for i in range(2)]
+            fig = go.Figure(data=go.Heatmap(
+                z=cm[::-1], x=['Predicted: No', 'Predicted: Yes'], y=['Actual: Yes', 'Actual: No'],
+                colorscale=[[0, '#1e293b'], [0.5, '#6366f1'], [1, '#c084fc']],
+                text=[text_annot[1], text_annot[0]], texttemplate="%{text}",
+                textfont=dict(size=14, color='white'), showscale=False,
+                hovertemplate='%{y} / %{x}<br>Count: %{z}<extra></extra>'
+            ))
+            fig.update_layout(title=dict(text=f'{name}', font=dict(size=14)),
+                              xaxis=dict(side='bottom'), yaxis=dict(autorange='reversed'))
+            st.plotly_chart(styled_chart(fig, 340), use_container_width=True)
+
+    # ───────────────────────────────────────────────────────────
+    # 2. PERFORMANCE COMPARISON TABLE
+    # ───────────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'><h3>📋 Model Performance Comparison</h3><p>Training & Testing metrics across all 3 algorithms (5-Fold Cross-Validation)</p></div>", unsafe_allow_html=True)
+
+    perf_rows = []
+    for name, res in results.items():
+        perf_rows.append({
+            'Algorithm': name,
+            'Train Accuracy': f"{res['train_acc']:.4f}",
+            'Test Accuracy': f"{res['test_acc']:.4f}",
+            'Train Precision': f"{res['train_precision']:.4f}",
+            'Test Precision': f"{res['test_precision']:.4f}",
+            'Train Recall': f"{res['train_recall']:.4f}",
+            'Test Recall': f"{res['test_recall']:.4f}",
+            'Train F1-Score': f"{res['train_f1']:.4f}",
+            'Test F1-Score': f"{res['test_f1']:.4f}",
+            'AUC Score': f"{res['auc']:.4f}",
         })
+    perf_df = pd.DataFrame(perf_rows)
+    st.dataframe(perf_df, hide_index=True, use_container_width=True)
+
+    # Visual comparison bars
+    c1, c2 = st.columns(2)
+    with c1:
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=model_comp['Model'], y=model_comp['AUC (mean)'],
-                             error_y=dict(type='data', array=model_comp['AUC (std)'].tolist()),
-                             marker_color=['#818cf8','#c084fc','#f472b6'],
-                             text=model_comp['AUC (mean)'].round(3), textposition='outside'))
-        fig.update_layout(title='Model Comparison — Cross-Validated AUC', yaxis_title='AUC Score',
-                          yaxis_range=[0.5, 1.0])
+        for i, name in enumerate(results.keys()):
+            fig.add_trace(go.Bar(name=name,
+                                 x=['Train Accuracy', 'Test Accuracy'],
+                                 y=[results[name]['train_acc'], results[name]['test_acc']],
+                                 marker_color=model_colors[name],
+                                 text=[f"{results[name]['train_acc']:.3f}", f"{results[name]['test_acc']:.3f}"],
+                                 textposition='outside'))
+        fig.update_layout(title='Training vs Testing Accuracy', barmode='group',
+                          yaxis_title='Accuracy', yaxis_range=[0, 1.15])
         st.plotly_chart(styled_chart(fig, 380), use_container_width=True)
 
     with c2:
         fig = go.Figure()
-        colors = ['#818cf8','#c084fc','#f472b6']
-        for i, (name, rdata) in enumerate(roc_data.items()):
-            fig.add_trace(go.Scatter(x=rdata['fpr'], y=rdata['tpr'], mode='lines',
-                                     name=f"{name} (AUC={rdata['auc']:.3f})",
-                                     line=dict(color=colors[i], width=2.5)))
-        fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', name='Random',
-                                 line=dict(color='#475569', dash='dash', width=1)))
-        fig.update_layout(title='ROC Curves', xaxis_title='False Positive Rate',
-                          yaxis_title='True Positive Rate')
+        metrics = ['test_precision', 'test_recall', 'test_f1', 'auc']
+        metric_labels = ['Precision', 'Recall', 'F1-Score', 'AUC']
+        for i, name in enumerate(results.keys()):
+            vals = [results[name][m] for m in metrics]
+            fig.add_trace(go.Bar(name=name, x=metric_labels, y=vals,
+                                 marker_color=model_colors[name],
+                                 text=[f"{v:.3f}" for v in vals], textposition='outside'))
+        fig.update_layout(title='Test Metrics Comparison', barmode='group',
+                          yaxis_title='Score', yaxis_range=[0, 1.15])
         st.plotly_chart(styled_chart(fig, 380), use_container_width=True)
 
-    # Feature Importance
+    # ───────────────────────────────────────────────────────────
+    # 3. ROC CURVES — all algorithms in one chart
+    # ───────────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'><h3>📈 ROC Curves — All Algorithms</h3><p>Receiver Operating Characteristic curves from aggregated 5-Fold CV test predictions</p></div>", unsafe_allow_html=True)
+
+    fig = go.Figure()
+    for name, res in results.items():
+        fig.add_trace(go.Scatter(
+            x=res['fpr'], y=res['tpr'], mode='lines',
+            name=f"{name} (AUC = {res['auc']:.3f})",
+            line=dict(color=model_colors[name], width=2.5)
+        ))
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random Baseline',
+                             line=dict(color='#475569', dash='dash', width=1.5)))
+    fig.update_layout(title='ROC Curves — Decision Tree vs Random Forest vs Gradient Boosting',
+                      xaxis_title='False Positive Rate (1 - Specificity)',
+                      yaxis_title='True Positive Rate (Sensitivity)',
+                      legend=dict(x=0.55, y=0.05, bgcolor='rgba(0,0,0,0)'))
+    st.plotly_chart(styled_chart(fig, 480), use_container_width=True)
+
+    # ───────────────────────────────────────────────────────────
+    # FEATURE IMPORTANCE
+    # ───────────────────────────────────────────────────────────
     st.markdown("<div class='section-header'><h3>🎯 Feature Importance Rankings</h3><p>What matters most in predicting attrition?</p></div>", unsafe_allow_html=True)
 
     selected_model = st.selectbox("Select model for feature importance:", list(results.keys()), index=1)
@@ -763,6 +876,7 @@ with tab3:
     st.markdown("<div class='section-header'><h3>📊 Consensus Feature Ranking</h3><p>Features consistently ranked important across all 3 models</p></div>", unsafe_allow_html=True)
 
     all_imp = pd.DataFrame()
+    colors = list(model_colors.values())
     for name, res in results.items():
         norm_imp = res['importance'] / res['importance'].max()
         all_imp[name] = norm_imp
@@ -783,6 +897,95 @@ with tab3:
         consistently emerge as the strongest predictors of attrition across all three models. 
         Employees with low income, high overtime, and low involvement are at highest risk.
     </div>""", unsafe_allow_html=True)
+
+    # ───────────────────────────────────────────────────────────
+    # 4. TEST DATA UPLOAD FOR PREDICTION
+    # ───────────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'><h3>📤 Upload Test Data for Attrition Prediction</h3><p>Upload a CSV with the same columns (Attrition column can be empty) to predict attrition labels</p></div>", unsafe_allow_html=True)
+
+    pred_model_choice = st.selectbox("Select model for prediction:", list(results.keys()), index=2, key='pred_model')
+    uploaded_file = st.file_uploader("Upload test CSV file", type=['csv'], key='test_upload')
+
+    if uploaded_file is not None:
+        try:
+            test_df = pd.read_csv(uploaded_file)
+            st.success(f"✅ Uploaded successfully — {test_df.shape[0]} rows × {test_df.shape[1]} columns")
+
+            # Prepare test data with same encoding
+            test_ml = test_df.copy()
+            cat_feats = ['BusinessTravel','Department','EducationField','Gender','JobRole','MaritalStatus','OverTime']
+            
+            missing_cols = [c for c in cat_feats if c not in test_ml.columns]
+            if missing_cols:
+                st.error(f"❌ Missing columns: {missing_cols}")
+            else:
+                for c in cat_feats:
+                    le = label_encoders[c]
+                    # Handle unseen labels gracefully
+                    known_classes = set(le.classes_)
+                    test_ml[c+'_enc'] = test_ml[c].apply(lambda x: le.transform([x])[0] if x in known_classes else -1)
+
+                feat_cols_pred = [c for c in feature_cols if c in test_ml.columns]
+                missing_feats = [c for c in feature_cols if c not in test_ml.columns]
+                if missing_feats:
+                    st.warning(f"⚠️ Missing feature columns (filled with 0): {missing_feats}")
+                    for mf in missing_feats:
+                        test_ml[mf] = 0
+                
+                X_test_new = test_ml[feature_cols]
+                X_test_scaled = fitted_scaler.transform(X_test_new)
+
+                chosen_model = results[pred_model_choice]['model']
+                predictions = chosen_model.predict(X_test_scaled)
+                probabilities = chosen_model.predict_proba(X_test_scaled)[:, 1]
+
+                test_df['Predicted_Attrition'] = np.where(predictions == 1, 'Yes', 'No')
+                test_df['Attrition_Probability'] = (probabilities * 100).round(2)
+
+                # Display results
+                st.markdown(f"#### Prediction Results — {pred_model_choice}")
+                
+                pred_counts = test_df['Predicted_Attrition'].value_counts()
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    yes_count = pred_counts.get('Yes', 0)
+                    no_count = pred_counts.get('No', 0)
+                    fig = go.Figure(data=[go.Pie(
+                        labels=['No (Stay)', 'Yes (Leave)'], values=[no_count, yes_count],
+                        hole=0.6, marker=dict(colors=['#34d399', '#f87171']),
+                        textinfo='label+value+percent'
+                    )])
+                    fig.update_layout(title='Prediction Distribution',
+                                     annotations=[dict(text=f"<b>{len(test_df)}</b><br>employees", x=0.5, y=0.5,
+                                                       font_size=14, font_color='#e0e6ed', showarrow=False)])
+                    st.plotly_chart(styled_chart(fig, 350), use_container_width=True)
+
+                with pc2:
+                    fig = go.Figure(go.Bar(
+                        x=test_df.sort_values('Attrition_Probability', ascending=False)['Attrition_Probability'],
+                        y=test_df.sort_values('Attrition_Probability', ascending=False)['EmployeeNumber'].astype(str) if 'EmployeeNumber' in test_df.columns else [f"Row {i+1}" for i in range(len(test_df))],
+                        orientation='h',
+                        marker=dict(color=['#f87171' if p >= 50 else '#fbbf24' if p >= 30 else '#34d399' for p in test_df.sort_values('Attrition_Probability', ascending=False)['Attrition_Probability']]),
+                        text=[f"{p:.1f}%" for p in test_df.sort_values('Attrition_Probability', ascending=False)['Attrition_Probability']],
+                        textposition='outside'
+                    ))
+                    fig.update_layout(title='Attrition Probability per Employee', xaxis_title='Probability %')
+                    st.plotly_chart(styled_chart(fig, 350), use_container_width=True)
+
+                # Show full table
+                display_cols = [c for c in ['EmployeeNumber','Age','Department','JobRole','MonthlyIncome','OverTime',
+                                           'Predicted_Attrition','Attrition_Probability'] if c in test_df.columns]
+                st.dataframe(test_df[display_cols].sort_values('Attrition_Probability', ascending=False),
+                            hide_index=True, use_container_width=True)
+
+                # Download button
+                csv_result = test_df.to_csv(index=False)
+                st.download_button("⬇️ Download Predictions CSV", csv_result, "attrition_predictions.csv", "text/csv")
+
+        except Exception as e:
+            st.error(f"❌ Error processing file: {e}")
+    else:
+        st.info("💡 Upload a CSV with the same columns as the training data. The Attrition column can be empty or missing — the model will predict it.")
 
 
 # =============================================================
